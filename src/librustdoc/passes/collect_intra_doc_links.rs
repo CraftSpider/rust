@@ -55,6 +55,25 @@ enum ErrorKind<'a> {
     AnchorFailure(AnchorFailure),
 }
 
+/// Representative of the successful resolution of a link
+///
+/// A link can be to either a user-defined type, with DefKind and DefId, or
+/// to a primitive, where we only really care about the fragment String
+enum Resolution {
+    Def(DefKind, DefId),
+    Primitive { fragment: String }
+}
+
+impl From<Res> for Resolution {
+    fn from(res: Res) -> Resolution {
+        match res {
+            Res::Def(kind, id) => Resolution::Def(kind, id),
+            Res::PrimTy(ty) => Resolution::Primitive { fragment: ... },
+            _ => panic!("Not a supported resolution type"),
+        }
+    }
+}
+
 impl<'a> From<ResolutionFailure<'a>> for ErrorKind<'a> {
     fn from(err: ResolutionFailure<'a>) -> Self {
         ErrorKind::Resolve(box err)
@@ -68,7 +87,7 @@ enum ResolutionFailure<'a> {
     ///
     /// `Namespace` is the namespace specified with a disambiguator
     /// (as opposed to the actual namespace of the `Res`).
-    WrongNamespace(Res, /* disambiguated */ Namespace),
+    WrongNamespace(Resolution, /* disambiguated */ Namespace),
     /// The link failed to resolve. `resolution_failure` should look to see if there's
     /// a more helpful error that can be given.
     NotResolved {
@@ -77,7 +96,7 @@ enum ResolutionFailure<'a> {
         /// If part of the link resolved, this has the `Res`.
         ///
         /// In `[std::io::Error::x]`, `std::io::Error` would be a partial resolution.
-        partial_res: Option<Res>,
+        partial_res: Option<Resolution>,
         /// The remaining unresolved path segments.
         ///
         /// In `[std::io::Error::x]`, `x` would be unresolved.
@@ -165,7 +184,7 @@ enum AnchorFailure {
     /// rustdoc uses the anchor as a side channel to know which page to link to;
     /// it doesn't show up in the generated link. Ideally, rustdoc would remove
     /// this limitation, allowing you to link to subheaders on primitives.
-    RustdocAnchorConflict(Res),
+    RustdocAnchorConflict(Resolution),
 }
 
 struct LinkCollector<'a, 'tcx> {
@@ -197,7 +216,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
         path_str: &'path str,
         current_item: &Option<String>,
         module_id: DefId,
-    ) -> Result<(Res, Option<String>), ErrorKind<'path>> {
+    ) -> Result<(Resolution, Option<String>), ErrorKind<'path>> {
         let cx = self.cx;
         let no_res = || ResolutionFailure::NotResolved {
             module_id,
@@ -256,7 +275,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                     ty::Adt(def, _) if def.is_enum() => {
                         if def.all_fields().any(|item| item.ident.name == variant_field_name) {
                             Ok((
-                                ty_res,
+                                ty_res.into(),
                                 Some(format!(
                                     "variant.{}.field.{}",
                                     variant_str, variant_field_name
@@ -265,7 +284,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                         } else {
                             Err(ResolutionFailure::NotResolved {
                                 module_id,
-                                partial_res: Some(Res::Def(DefKind::Enum, def.did)),
+                                partial_res: Some(Resolution::Def(DefKind::Enum, def.did)),
                                 unresolved: variant_field_str.into(),
                             }
                             .into())
@@ -273,13 +292,13 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                     }
                     _ => unreachable!(),
                 }
-            }
+            },
             _ => Err(ResolutionFailure::NotResolved {
                 module_id,
-                partial_res: Some(ty_res),
+                partial_res: Some(ty_res.into()),
                 unresolved: variant_str.into(),
-            }
-            .into()),
+            })
+            .into()
         }
     }
 
@@ -294,7 +313,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
         module_id: DefId,
         item_name: Symbol,
         item_str: &'path str,
-    ) -> Result<(Res, Option<String>), ErrorKind<'path>> {
+    ) -> Result<(Resolution, Option<String>), ErrorKind<'path>> {
         let cx = self.cx;
 
         PrimitiveType::from_hir(prim_ty)
@@ -330,7 +349,8 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                 );
                 ResolutionFailure::NotResolved {
                     module_id,
-                    partial_res: Some(Res::PrimTy(prim_ty)),
+                    // FIXME(CraftSpider)
+                    partial_res: Some(Resolution::Primitive { fragment: prim_ty }),
                     unresolved: item_str.into(),
                 }
                 .into()
@@ -409,7 +429,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
         current_item: &Option<String>,
         module_id: DefId,
         extra_fragment: &Option<String>,
-    ) -> Result<(Res, Option<String>), ErrorKind<'path>> {
+    ) -> Result<(Resolution, Option<String>), ErrorKind<'path>> {
         let cx = self.cx;
 
         if let Some(res) = self.resolve_path(path_str, ns, module_id) {
@@ -429,16 +449,16 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                 Res::PrimTy(ty) => {
                     if extra_fragment.is_some() {
                         return Err(ErrorKind::AnchorFailure(
-                            AnchorFailure::RustdocAnchorConflict(res),
+                            AnchorFailure::RustdocAnchorConflict(res.into()),
                         ));
                     }
-                    return Ok((res, Some(ty.name_str().to_owned())));
+                    return Ok((res.into(), Some(ty.name_str().to_owned())));
                 }
                 Res::Def(DefKind::Mod, _) => {
-                    return Ok((res, extra_fragment.clone()));
+                    return Ok((res.into(), extra_fragment.clone()));
                 }
                 _ => {
-                    return Ok((res, extra_fragment.clone()));
+                    return Ok((res.into(), extra_fragment.clone()));
                 }
             }
         }
@@ -642,7 +662,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
         module_id: DefId,
         current_item: &Option<String>,
         extra_fragment: &Option<String>,
-    ) -> Option<Res> {
+    ) -> Option<Resolution> {
         // resolve() can't be used for macro namespace
         let result = match ns {
             Namespace::MacroNS => self.resolve_macro(path_str, module_id).map_err(ErrorKind::from),
@@ -652,12 +672,12 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
         };
 
         let res = match result {
-            Ok(res) => Some(res),
+            Ok(res) => Some(res.into()),
             Err(ErrorKind::Resolve(box kind)) => kind.full_res(),
             Err(ErrorKind::AnchorFailure(AnchorFailure::RustdocAnchorConflict(res))) => Some(res),
             Err(ErrorKind::AnchorFailure(AnchorFailure::MultipleAnchors)) => None,
         };
-        self.kind_side_channel.take().map(|(kind, id)| Res::Def(kind, id)).or(res)
+        self.kind_side_channel.take().map(|(kind, id)| Resolution::Def(kind, id)).or(res)
     }
 }
 
@@ -1248,7 +1268,7 @@ impl LinkCollector<'_, '_> {
         extra_fragment: Option<String>,
         ori_link: &str,
         link_range: Option<Range<usize>>,
-    ) -> Option<(Res, Option<String>)> {
+    ) -> Option<(Resolution, Option<String>)> {
         match disambiguator.map(Disambiguator::ns) {
             Some(ns @ (ValueNS | TypeNS)) => {
                 match self.resolve(path_str, ns, &current_item, base_node, &extra_fragment) {
@@ -1385,7 +1405,7 @@ impl LinkCollector<'_, '_> {
             }
             Some(MacroNS) => {
                 match self.resolve_macro(path_str, base_node) {
-                    Ok(res) => Some((res, extra_fragment)),
+                    Ok(res) => Some((res.into(), extra_fragment)),
                     Err(mut kind) => {
                         // `resolve_macro` only looks in the macro namespace. Try to give a better error if possible.
                         for &ns in &[TypeNS, ValueNS] {
@@ -1679,14 +1699,14 @@ fn resolution_failure(
         dox,
         &link_range,
         |diag, sp| {
-            let item = |res: Res| {
+            let item = |res: Resolution| {
                 format!(
                     "the {} `{}`",
                     res.descr(),
                     collector.cx.tcx.item_name(res.def_id()).to_string()
                 )
             };
-            let assoc_item_not_allowed = |res: Res| {
+            let assoc_item_not_allowed = |res: Resolution| {
                 let def_id = res.def_id();
                 let name = collector.cx.tcx.item_name(def_id);
                 format!(
@@ -2026,16 +2046,16 @@ fn handle_variant(
     cx: &DocContext<'_>,
     res: Res,
     extra_fragment: &Option<String>,
-) -> Result<(Res, Option<String>), ErrorKind<'static>> {
+) -> Result<(Resolution, Option<String>), ErrorKind<'static>> {
     use rustc_middle::ty::DefIdTree;
 
     if extra_fragment.is_some() {
-        return Err(ErrorKind::AnchorFailure(AnchorFailure::RustdocAnchorConflict(res)));
+        return Err(ErrorKind::AnchorFailure(AnchorFailure::RustdocAnchorConflict(res.into())));
     }
     cx.tcx
         .parent(res.def_id())
         .map(|parent| {
-            let parent_def = Res::Def(DefKind::Enum, parent);
+            let parent_def = Resolution::Def(DefKind::Enum, parent);
             let variant = cx.tcx.expect_variant_res(res);
             (parent_def, Some(format!("variant.{}", variant.ident.name)))
         })
