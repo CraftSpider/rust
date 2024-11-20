@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io;
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -11,9 +11,9 @@ use crate::shims::files::{FileDescription, FileDescriptionRef, EvalContextExt as
 use crate::shims::time::system_time_to_duration;
 
 #[derive(Debug)]
-struct FileHandle {
-    file: File,
-    writable: bool,
+pub struct FileHandle {
+    pub(crate) file: File,
+    pub(crate) writable: bool,
 }
 
 impl FileDescription for FileHandle {
@@ -92,19 +92,42 @@ impl FileDescription for FileHandle {
         }
     }
 
+    fn metadata<'tcx>(&self) -> InterpResult<'tcx, io::Result<Metadata>> {
+        interp_ok(self.file.metadata())
+    }
+
     fn is_tty(&self, communicate_allowed: bool) -> bool {
         communicate_allowed && self.file.is_terminal()
     }
 }
 
 #[derive(Debug)]
-struct DirHandle {
-    path: PathBuf,
+pub struct DirHandle {
+    pub(crate) path: PathBuf,
 }
 
 impl FileDescription for DirHandle {
     fn name(&self) -> &'static str {
         "directory"
+    }
+
+    fn metadata<'tcx>(&self) -> InterpResult<'tcx, io::Result<Metadata>> {
+        interp_ok(self.path.metadata())
+    }
+}
+
+#[derive(Debug)]
+pub struct MetadataHandle {
+    pub(crate) path: PathBuf,
+}
+
+impl FileDescription for MetadataHandle {
+    fn name(&self) -> &'static str {
+        "metadata-only"
+    }
+
+    fn metadata<'tcx>(&self) -> InterpResult<'tcx, io::Result<Metadata>> {
+        interp_ok(self.path.metadata())
     }
 }
 
@@ -167,13 +190,18 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // This must be passed to allow getting directory handles. If not passed, we error on trying
         // to open directories below
         let file_flag_backup_semantics = this.eval_windows_u32("c", "FILE_FLAG_BACKUP_SEMANTICS");
+        let file_flag_open_reparse_point = this.eval_windows_u32("c", "FILE_FLAG_OPEN_REPARSE_POINT");
 
         let flags_and_attributes = match flags_and_attributes {
             0 => file_attribute_normal,
             _ => flags_and_attributes,
         };
-        if ![file_attribute_normal, file_flag_backup_semantics].contains(&flags_and_attributes) {
+        if !(file_attribute_normal | file_flag_backup_semantics | file_flag_open_reparse_point) & flags_and_attributes != 0 {
             throw_unsup_format!("CreateFileW: Unsupported flags_and_attributes: {flags_and_attributes}");
+        }
+
+        if flags_and_attributes & file_flag_open_reparse_point != 0 && creation_disposition == create_always {
+            throw_machine_stop!(TerminationInfo::Abort("Invalid CreateFileW argument combination: FILE_FLAG_OPEN_REPARSE_POINT with CREATE_ALWAYS".to_string()));
         }
 
         if template_file != 0 {
@@ -206,6 +234,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             options.truncate(true);
         } else if creation_disposition == create_new {
             options.create_new(true);
+            if !desired_write {
+                options.append(true);
+            }
         } else if creation_disposition == open_always {
             if file_name.exists() {
                 this.set_last_error(IoError::WindowsError("ERROR_ALREADY_EXISTS"))?;
@@ -220,6 +251,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let handle = if is_dir && exists {
             let fh = &mut this.machine.fds;
             let fd = fh.insert_new(DirHandle { path: file_name.into() });
+            Ok(Handle::File(fd as u32))
+        } else if creation_disposition == open_existing && desired_access == 0 {
+            // Windows supports handles with no permissions. These allow things such as reading
+            // metadata, but not file content.
+            let fh = &mut this.machine.fds;
+            let fd = fh.insert_new(MetadataHandle { path: file_name.into() });
             Ok(Handle::File(fd as u32))
         } else {
             options.open(file_name).map(|file| {
@@ -261,14 +298,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             this.invalid_handle("GetFileInformationByHandle")?
         };
 
-        let metadata = if let Some(desc) = desc.downcast::<FileHandle>() {
-            desc.file.metadata()
-        } else if let Some(desc) = desc.downcast::<DirHandle>() {
-            desc.path.metadata()
-        } else {
-            throw_unsup_format!("`GetFileInformationByHandle` is only supported on file or directory backed handles");
-        };
-        let metadata = match metadata {
+        let metadata = match desc.metadata()? {
             Ok(meta) => meta,
             Err(e) => {
                 this.set_last_error(e)?;
@@ -433,6 +463,175 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Return whether this was a success. >= 0 is success.
         // For the error code we arbitrarily pick 0xC0000185, STATUS_IO_DEVICE_ERROR.
         interp_ok(Scalar::from_u32(if written.is_some() { 0 } else { 0xC0000185u32 }))
+    }
+
+    fn NtReadFile(
+        &mut self,
+        handle: &OpTy<'tcx>,          // HANDLE
+        event: &OpTy<'tcx>,           // HANDLE
+        apc_routine: &OpTy<'tcx>,     // PIO_APC_ROUTINE
+        apc_ctx: &OpTy<'tcx>,         // PVOID
+        io_status_block: &OpTy<'tcx>, // PIO_STATUS_BLOCK
+        buf: &OpTy<'tcx>,             // PVOID
+        n: &OpTy<'tcx>,               // ULONG
+        byte_offset: &OpTy<'tcx>,     // PLARGE_INTEGER
+        key: &OpTy<'tcx>,             // PULONG
+    ) -> InterpResult<'tcx, Scalar> {
+        // ^ Returns NTSTATUS (u32 on Windows)
+        let this = self.eval_context_mut();
+        let handle = this.read_handle(handle)?;
+        let event = this.read_handle(event)?;
+        let apc_routine = this.read_pointer(apc_routine)?;
+        let apc_ctx = this.read_pointer(apc_ctx)?;
+        let buf = this.read_pointer(buf)?;
+        let n = this.read_scalar(n)?.to_u32()?;
+        let byte_offset = this.read_target_usize(byte_offset)?; // is actually a pointer
+        let key = this.read_pointer(key)?;
+        let io_status_block = this
+            .deref_pointer_as(io_status_block, this.windows_ty_layout("IO_STATUS_BLOCK"))?;
+
+        if event != Handle::Null {
+            throw_unsup_format!(
+                "`NtWriteFile` `Event` parameter is non-null, which is unsupported"
+            );
+        }
+
+        if !this.ptr_is_null(apc_routine)? {
+            throw_unsup_format!(
+                "`NtWriteFile` `ApcRoutine` parameter is not null, which is unsupported"
+            );
+        }
+
+        if !this.ptr_is_null(apc_ctx)? {
+            throw_unsup_format!(
+                "`NtWriteFile` `ApcContext` parameter is not null, which is unsupported"
+            );
+        }
+
+        if byte_offset != 0 {
+            throw_unsup_format!(
+                "`NtWriteFile` `ByteOffset` parameter is non-null, which is unsupported"
+            );
+        }
+
+        if !this.ptr_is_null(key)? {
+            throw_unsup_format!(
+                "`NtWriteFile` `Key` parameter is not null, which is unsupported"
+            );
+        }
+
+        let read = match handle {
+            Handle::Pseudo(PseudoHandle::Stdin) => {
+                // stdout/stderr
+                let mut buf_cont = vec![0u8; n as usize];
+                let res =
+                    io::Read::read(&mut io::stdin(), &mut buf_cont);
+                this.write_bytes_ptr(buf, buf_cont)?;
+                // We write at most `n` bytes, which is a `u32`, so we cannot have written more than that.
+                res.ok().map(|n| u32::try_from(n).unwrap())
+            }
+            Handle::File(fd) => {
+                let Some(desc) = this.machine.fds.get(fd as i32) else {
+                    this.invalid_handle("NtReadFile")?
+                };
+
+                let errno_layout = this.machine.layouts.u32;
+                let out_place = this.allocate(errno_layout, MiriMemoryKind::Machine.into())?;
+                desc.read(&desc, this.machine.communicate(), buf, n as usize, &out_place, this)?;
+                let read = this.read_scalar(&out_place)?.to_u32()?;
+                this.deallocate_ptr(out_place.ptr(), None, MiriMemoryKind::Machine.into())?;
+                Some(read)
+            }
+            _ => this.invalid_handle("NtReadFile")?,
+        };
+
+        // We have to put the result into io_status_block.
+        if let Some(n) = read {
+            let io_status_information =
+                this.project_field_named(&io_status_block, "Information")?;
+            this.write_scalar(
+                Scalar::from_target_usize(n.into(), this),
+                &io_status_information,
+            )?;
+        }
+
+        // Return whether this was a success. >= 0 is success.
+        // For the error code we arbitrarily pick 0xC0000185, STATUS_IO_DEVICE_ERROR.
+        interp_ok(Scalar::from_u32(if read.is_some() { 0 } else { 0xC0000185u32 }))
+    }
+
+    fn SetFilePointerEx(
+        &mut self,
+        file: &OpTy<'tcx>,         // HANDLE
+        dist_to_move: &OpTy<'tcx>, // LARGE_INTEGER
+        new_fp: &OpTy<'tcx>,       // PLARGE_INTEGER
+        move_method: &OpTy<'tcx>,  // DWORD
+    ) -> InterpResult<'tcx, Scalar> {
+        // ^ Returns BOOL (i32 on Windows)
+        let this = self.eval_context_mut();
+        let file = this.read_handle(file)?;
+        let dist_to_move = this.read_scalar(dist_to_move)?.to_i64()?;
+        let move_method = this.read_scalar(move_method)?.to_u32()?;
+
+        let fd = match file {
+            Handle::File(fd) => fd,
+            _ => this.invalid_handle("SetFilePointerEx")?,
+        };
+
+        let Some(desc) = this.machine.fds.get(fd as i32) else {
+            throw_unsup_format!("`SetFilePointerEx` is only supported on file backed handles");
+        };
+
+        let file_begin = this.eval_windows_u32("c", "FILE_BEGIN");
+        let file_current = this.eval_windows_u32("c", "FILE_CURRENT");
+        let file_end = this.eval_windows_u32("c", "FILE_END");
+
+        let seek = if move_method == file_begin {
+            SeekFrom::Start(dist_to_move.try_into().unwrap())
+        } else if move_method == file_current {
+            SeekFrom::Current(dist_to_move)
+        } else if move_method == file_end {
+            SeekFrom::End(dist_to_move)
+        } else {
+            throw_unsup_format!("Invalid move method: {move_method}")
+        };
+
+        match desc.seek(this.machine.communicate(), seek)? {
+            Ok(n) => {
+                this.write_scalar(
+                    Scalar::from_i64(n as i64),
+                    &this.deref_pointer(new_fp)?,
+                )?;
+                interp_ok(this.eval_windows("c", "TRUE"))
+            },
+            Err(e) => {
+                this.set_last_error(e)?;
+                interp_ok(this.eval_windows("c", "FALSE"))
+            }
+        }
+    }
+
+    fn SetFileInformationByHandle(
+        &mut self,
+        file: &OpTy<'tcx>,
+        file_info_class: &OpTy<'tcx>,
+        file_info: &OpTy<'tcx>,
+        _buffer_size: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        // ^ Returns BOOL (i32 on Windows)
+        let this = self.eval_context_mut();
+        let _file = this.read_handle(file)?;
+        let file_info_class = this.read_scalar(file_info_class)?.to_u32()?;
+        // TODO: Deref pointer for buffer_size
+
+        match file_info_class {
+            // FileEndOfFileInfo
+            6 => {
+                let file_info = this.deref_pointer_as(file_info, this.windows_ty_layout("FILE_END_OF_FILE_INFO"))?;
+                todo!()
+            }
+            _ => throw_unsup_format!("SetFileInformationByHandle: Unsupported file_info_class {file_info_class}"),
+        }
     }
 }
 

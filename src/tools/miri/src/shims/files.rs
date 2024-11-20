@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, SeekFrom, Write};
-use std::io;
+use std::{fs, io};
 use std::ops::Deref;
 use std::rc::{Rc, Weak};
 
@@ -67,6 +67,12 @@ pub trait FileDescription: std::fmt::Debug + Any {
         _ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, io::Result<()>> {
         throw_unsup_format!("cannot close {}", self.name());
+    }
+
+    fn metadata<'tcx>(&self) -> InterpResult<'tcx, io::Result<fs::Metadata>> {
+        throw_unsup_format!(
+            "obtaining metadata is only supported on file-backed file descriptors"
+        );
     }
 
     fn is_tty(&self, _communicate_allowed: bool) -> bool {

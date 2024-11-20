@@ -1676,16 +1676,7 @@ impl FileMetadata {
             return interp_ok(Err(LibcError("EBADF")));
         };
 
-        let file = &fd
-            .downcast::<FileHandle>()
-            .ok_or_else(|| {
-                err_unsup_format!(
-                    "obtaining metadata is only supported on file-backed file descriptors"
-                )
-            })?
-            .file;
-
-        let metadata = file.metadata();
+        let metadata = fd.metadata()?;
         drop(fd);
         FileMetadata::from_meta(ecx, metadata)
     }

@@ -3,10 +3,12 @@ use std::mem::variant_count;
 use rustc_abi::HasDataLayout;
 
 use crate::*;
+use crate::shims::windows::fs::{DirHandle, FileHandle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PseudoHandle {
     CurrentThread,
+    CurrentProcess,
     Stdin,
     Stdout,
     Stderr,
@@ -27,10 +29,12 @@ impl PseudoHandle {
     const STDIN_VALUE: u32 = 1;
     const STDOUT_VALUE: u32 = 2;
     const STDERR_VALUE: u32 = 3;
+    const CURRENT_PROCESS_VALUE: u32 = 4;
 
     fn value(self) -> u32 {
         match self {
             Self::CurrentThread => Self::CURRENT_THREAD_VALUE,
+            Self::CurrentProcess => Self::CURRENT_PROCESS_VALUE,
             Self::Stdin => Self::STDIN_VALUE,
             Self::Stdout => Self::STDOUT_VALUE,
             Self::Stderr => Self::STDERR_VALUE,
@@ -40,6 +44,7 @@ impl PseudoHandle {
     fn from_value(value: u32) -> Option<Self> {
         match value {
             Self::CURRENT_THREAD_VALUE => Some(Self::CurrentThread),
+            Self::CURRENT_PROCESS_VALUE => Some(Self::CurrentProcess),
             Self::STDIN_VALUE => Some(Self::Stdin),
             Self::STDOUT_VALUE => Some(Self::Stdout),
             Self::STDERR_VALUE => Some(Self::Stderr),
@@ -71,7 +76,7 @@ impl Handle {
             Self::Pseudo(pseudo_handle) => pseudo_handle.value(),
             Self::Thread(thread) => thread,
             Self::File(fd) => fd,
-            Self::Invalid => 0xFFFFFFF8,
+            Self::Invalid => 0x1FFFFFFF,
         }
     }
 
@@ -106,7 +111,7 @@ impl Handle {
         assert!(discriminant < 2u32.pow(disc_size));
 
         // make sure the data fits into `data_size` bits
-        assert!(data < 2u32.pow(data_size));
+        assert!(data <= 2u32.pow(data_size));
 
         // packs the data into the lower `data_size` bits
         // and packs the discriminant right above the data
@@ -205,6 +210,67 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             throw_unsup_format!("Invalid argument to `GetStdHandle`: {which}")
         };
         interp_ok(handle.to_scalar(this))
+    }
+
+    fn DuplicateHandle(
+        &mut self,
+        src_proc: &OpTy<'tcx>,       // HANDLE
+        src: &OpTy<'tcx>,            // HANDLE
+        target_proc: &OpTy<'tcx>,    // HANDLE
+        target: &OpTy<'tcx>,         // LPHANDLE
+        desired_access: &OpTy<'tcx>, // DWORD
+        inherit_handle: &OpTy<'tcx>, // BOOL
+        options: &OpTy<'tcx>,        // DWORD
+    ) -> InterpResult<'tcx, Scalar> {
+        let this = self.eval_context_mut();
+        let src_proc = this.read_handle(src_proc)?;
+        let src = this.read_handle(src)?;
+        let target_proc = this.read_handle(target_proc)?;
+        let desired_access = this.read_scalar(desired_access)?.to_u32()?;
+        let _ = this.read_scalar(inherit_handle)?.to_i32()?;
+        let options = this.read_scalar(options)?.to_u32()?;
+
+        if src_proc != Handle::Pseudo(PseudoHandle::CurrentProcess) || src_proc != target_proc {
+            throw_unsup_format!("DuplicateHandle: Unsupported process handle")
+        }
+
+        let duplicate_same_access = this.eval_windows_u32("c", "DUPLICATE_SAME_ACCESS");
+
+        if desired_access != 0 || options != duplicate_same_access {
+            throw_unsup_format!("DuplicateHandle: Handle access rights not implemented")
+        }
+
+        let out = match src {
+            Handle::Pseudo(pseudo) => Handle::Pseudo(pseudo),
+            Handle::File(fd) => {
+                let Some(desc) = this.machine.fds.get(fd as i32) else {
+                    this.invalid_handle("DuplicateHandle")?
+                };
+                let fd = if let Some(file) = desc.downcast::<FileHandle>() {
+                    let f = match file.file.try_clone() {
+                        Err(e) => {
+                            this.set_last_error(e)?;
+                            return interp_ok(this.eval_windows("c", "FALSE"))
+                        }
+                        Ok(f) => f,
+                    };
+                    this.machine.fds.insert_new(FileHandle { file: f, writable: file.writable })
+                } else if let Some(dir) = desc.downcast::<DirHandle>() {
+                    this.machine.fds.insert_new(DirHandle { path: dir.path.clone() })
+                } else {
+                    throw_unsup_format!("DuplicateHandle: Invalid file descriptor for")
+                };
+                Handle::File(fd as u32)
+            }
+            _ => throw_unsup_format!("Cannot duplicate handle")
+        };
+
+        this.write_scalar(
+            out.to_scalar(this),
+            &this.deref_pointer_as(target, this.machine.layouts.i64)?,
+        )?;
+
+        interp_ok(this.eval_windows("c", "TRUE"))
     }
 
     fn CloseHandle(&mut self, handle_op: &OpTy<'tcx>) -> InterpResult<'tcx, Scalar> {

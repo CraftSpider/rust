@@ -140,6 +140,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let result = this.GetUserProfileDirectoryW(token, buf, size)?;
                 this.write_scalar(result, dest)?;
             }
+            "GetCurrentProcess" => {
+                let [] = this.check_shim(abi, ExternAbi::System { unwind: false }, link_name, args)?;
+                this.write_scalar(Handle::Pseudo(PseudoHandle::CurrentProcess).to_scalar(this), dest)?;
+            }
             "GetCurrentProcessId" => {
                 let [] =
                     this.check_shim(abi, ExternAbi::System { unwind: false }, link_name, args)?;
@@ -161,6 +165,24 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     key,
                 ] = this.check_shim(abi, ExternAbi::System { unwind: false }, link_name, args)?;
                 let res = this.NtWriteFile(handle, event, apc_routine, apc_context, io_status_block, buf, n, byte_offset, key)?;
+                this.write_scalar(
+                    res,
+                    dest,
+                )?;
+            }
+            "NtReadFile" => {
+                let [
+                    handle,
+                    event,
+                    apc_routine,
+                    apc_context,
+                    io_status_block,
+                    buf,
+                    n,
+                    byte_offset,
+                    key,
+                ] = this.check_shim(abi, ExternAbi::System { unwind: false }, link_name, args)?;
+                let res = this.NtReadFile(handle, event, apc_routine, apc_context, io_status_block, buf, n, byte_offset, key)?;
                 this.write_scalar(
                     res,
                     dest,
@@ -209,6 +231,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             "DeleteFileW" => {
                 let [file_name] = this.check_shim(abi, ExternAbi::System { unwind: false }, link_name, args)?;
                 let res = this.DeleteFileW(file_name)?;
+                this.write_scalar(res, dest)?;
+            }
+            "SetFilePointerEx" => {
+                let [file, distance_to_move, new_file_pointer, move_method] = this.check_shim(abi, ExternAbi::System { unwind: false }, link_name, args)?;
+                let res = this.SetFilePointerEx(file, distance_to_move, new_file_pointer, move_method)?;
+                this.write_scalar(res, dest)?;
+            }
+            "SetFileInformationByHandle" => {
+                let [file, file_information_class, file_info, buffer_size] = this.check_shim(abi, ExternAbi::System { unwind: false }, link_name, args)?;
+                let res = this.SetFileInformationByHandle(file, file_information_class, file_info, buffer_size)?;
                 this.write_scalar(res, dest)?;
             }
 
@@ -602,6 +634,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let res = this.GetStdHandle(which)?;
                 this.write_scalar(res, dest)?;
             }
+            "DuplicateHandle" => {
+                let [src_proc, src, target_proc, target, desired_access, inherit, options] = this.check_shim(abi, ExternAbi::System { unwind: false }, link_name, args)?;
+                let ret = this.DuplicateHandle(src_proc, src, target_proc, target, desired_access, inherit, options)?;
+                this.write_scalar(ret, dest)?;
+            }
             "CloseHandle" => {
                 let [handle] =
                     this.check_shim(abi, ExternAbi::System { unwind: false }, link_name, args)?;
@@ -615,11 +652,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     this.check_shim(abi, ExternAbi::System { unwind: false }, link_name, args)?;
                 this.check_no_isolation("`GetModuleFileNameW`")?;
 
-                let handle = this.read_target_usize(handle)?;
+                let handle = this.read_handle(handle)?;
                 let filename = this.read_pointer(filename)?;
                 let size = this.read_scalar(size)?.to_u32()?;
 
-                if handle != 0 {
+                if handle != Handle::Null {
                     throw_unsup_format!("`GetModuleFileNameW` only supports the NULL handle");
                 }
 
